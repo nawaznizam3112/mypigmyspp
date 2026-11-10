@@ -9,19 +9,44 @@ Interest
   Simple interest on EVERY deposit from the day it was paid until maturity:
       interest = amount * rate% * (days_to_maturity / 365)
 
+Passbook PDF
+  * Uses a Unicode font so the rupee sign prints (falls back to "Rs." if none is found).
+    Streamlit Cloud: add packages.txt with  fonts-dejavu-core  (or drop NotoSans-Regular.ttf /
+    NotoSans-Bold.ttf into a ./fonts folder next to app.py).
+  * Logo, signature image, address and signatory title are set on the admin "Settings" page.
+
 Default login (change immediately!):  admin / admin123
 Override with env/secret ADMIN_PASSWORD before first run.
 """
+import base64
 import hashlib
 import os
+import re
 import secrets
 import sqlite3
+import zipfile
 from datetime import date, datetime, timedelta
+from io import BytesIO
+from xml.sax.saxutils import escape
 
 import pandas as pd
 import streamlit as st
+from PIL import Image as PILImage
+from reportlab.graphics.shapes import Circle, Drawing, String
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (BaseDocTemplate, Flowable, Frame, HRFlowable, KeepTogether, PageBreak,
+                                PageTemplate, Paragraph, Spacer, Table, TableStyle)
+from reportlab.platypus import Image as RLImage
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("PIGMY_DB", "pigmy.db")
+COMPANY_NAME = os.environ.get("COMPANY_NAME", "Pigmy Collection Co.")   # default; editable in Settings page
 PREMATURE_INTEREST_FACTOR = 0.0   # 0 = principal only on premature closure, 0.5 = half interest
 CUR = "₹"
 
@@ -74,6 +99,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS collections(
                 id INTEGER PRIMARY KEY, account_id INTEGER, coll_date TEXT,
                 amount REAL, agent_id INTEGER, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS payouts(
                 id INTEGER PRIMARY KEY, account_id INTEGER, paid_on TEXT,
                 principal REAL, interest REAL, total REAL, kind TEXT, paid_by INTEGER);
@@ -92,8 +118,22 @@ def init_db():
 
 
 # ------------------------------------------------------------- business logic
+def inr(x, dec=2):
+    """Indian digit grouping: 1234567.5 -> 12,34,567.50"""
+    whole, _, frac = f"{abs(x):.{dec}f}".partition(".")
+    if len(whole) > 3:
+        head, tail, parts = whole[:-3], whole[-3:], []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        whole = ",".join(parts + [tail])
+    return ("-" if x < 0 else "") + whole + (f".{frac}" if dec else "")
+
+
 def money(x):
-    return f"{CUR}{x:,.2f}"
+    return f"{CUR}{inr(x)}"
 
 
 def accounts_df(agent_id=None):
@@ -139,6 +179,232 @@ def label(r):
 def add_collection(acc_id, amount, coll_date, agent_id):
     run("INSERT INTO collections(account_id,coll_date,amount,agent_id,created_at) VALUES(?,?,?,?,?)",
         (int(acc_id), str(coll_date), float(amount), int(agent_id), datetime.now().isoformat(timespec="seconds")))
+
+
+# ------------------------------------------------ settings, fonts & passbook PDF
+SETTING_DEFAULTS = {"company_name": COMPANY_NAME, "company_address": "", "company_phone": "",
+                    "signatory": "Authorised Signatory", "logo_b64": "", "sign_b64": ""}
+
+
+def get_settings():
+    s = dict(SETTING_DEFAULTS)
+    s.update({r.key: r.value or "" for r in q("SELECT key, value FROM settings").itertuples()})
+    return s
+
+
+def set_setting(key, value):
+    run("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value))
+
+
+def prep_image(upload):
+    """Uploaded logo/signature -> small PNG, base64 text (stored in the DB)."""
+    im = PILImage.open(upload)
+    im.thumbnail((600, 600))
+    buf = BytesIO()
+    im.convert("RGBA").save(buf, "PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+FONT_PAIRS = [  # (regular, bold) - first pair that exists AND contains the rupee glyph wins
+    (f"{HERE}/fonts/NotoSans-Regular.ttf", f"{HERE}/fonts/NotoSans-Bold.ttf"),
+    (f"{HERE}/fonts/DejaVuSans.ttf", f"{HERE}/fonts/DejaVuSans-Bold.ttf"),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+    ("/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"),
+]
+
+
+@st.cache_resource
+def pdf_fonts():
+    """Returns (regular_font, bold_font, rupee_symbol)."""
+    for i, (reg, bold) in enumerate(FONT_PAIRS):
+        if os.path.exists(reg) and os.path.exists(bold):
+            try:
+                f = TTFont(f"PB{i}", reg)
+                if 0x20B9 not in f.face.charToGlyph:
+                    continue
+                pdfmetrics.registerFont(f)
+                pdfmetrics.registerFont(TTFont(f"PB{i}-Bold", bold))
+                pdfmetrics.registerFontFamily(f"PB{i}", normal=f"PB{i}", bold=f"PB{i}-Bold")
+                return f"PB{i}", f"PB{i}-Bold", "₹"
+            except Exception:
+                continue
+    return "Helvetica", "Helvetica-Bold", "Rs."
+
+
+def _img(b64, max_w, max_h):
+    if not b64:
+        return None
+    try:
+        raw = base64.b64decode(b64)
+        w, h = ImageReader(BytesIO(raw)).getSize()
+        k = min(max_w / w, max_h / h)
+        return RLImage(BytesIO(raw), width=w * k, height=h * k, mask="auto")
+    except Exception:
+        return None
+
+
+class AcctMark(Flowable):
+    """Zero-size marker so the footer knows where each passbook starts (page numbers restart)."""
+    def __init__(self, label):
+        super().__init__()
+        self.label = label
+
+    def wrap(self, aw, ah):
+        return 0, 0
+
+    def draw(self):
+        pass
+
+
+class PassbookDoc(BaseDocTemplate):
+    font = "Helvetica"
+    first_page, label = 1, ""
+
+    def __init__(self, buf, **kw):
+        super().__init__(buf, **kw)
+        frame = Frame(self.leftMargin, self.bottomMargin, self.width, self.height,
+                      leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
+        self.addPageTemplates([PageTemplate(id="p", frames=[frame], onPageEnd=self._footer)])
+
+    def afterFlowable(self, fl):
+        if isinstance(fl, AcctMark):
+            self.first_page, self.label = self.page, fl.label
+
+    def _footer(self, canvas, doc):
+        canvas.saveState()
+        canvas.setFont(self.font, 8)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(15 * mm, 10 * mm, f"{self.label}  ·  Printed {datetime.now():%d-%b-%Y %H:%M}")
+        canvas.drawRightString(A4[0] - 15 * mm, 10 * mm, f"Page {doc.page - self.first_page + 1}")
+        canvas.restoreState()
+
+
+def passbook_story(a, addr, tx, po, S):
+    F, FB, R, cfg = S["font"], S["bold"], S["rupee"], S["cfg"]
+    rs = lambda x: f"{R}{'' if R == '₹' else ' '}{inr(x)}"
+    ink, accent, zebra = colors.HexColor("#1f2937"), colors.HexColor("#0f766e"), colors.HexColor("#f3f4f6")
+    ss = getSampleStyleSheet()
+
+    def P(**kw):
+        base = dict(fontName=F, textColor=ink, fontSize=9, leading=11)
+        base.update(kw)
+        return ParagraphStyle("x", parent=ss["Normal"], **base)
+
+    def grid(data, widths, header=True):
+        t = Table(data, colWidths=widths, repeatRows=1 if header else 0)
+        style = [("FONTNAME", (0, 0), (-1, -1), F), ("FONTSIZE", (0, 0), (-1, -1), 9),
+                 ("TEXTCOLOR", (0, 0), (-1, -1), ink), ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                 ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]
+        if header:
+            style += [("BACKGROUND", (0, 0), (-1, 0), accent), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                      ("FONTNAME", (0, 0), (-1, 0), FB), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, zebra])]
+        t.setStyle(TableStyle(style))
+        return t
+
+    # ---- header: logo + company block
+    txt = [Paragraph(escape(cfg["company_name"]), P(fontName=FB, fontSize=18, leading=21, textColor=accent))]
+    if cfg["company_address"].strip():
+        txt.append(Paragraph(escape(cfg["company_address"]).replace("\n", "<br/>"),
+                             P(fontSize=8.5, textColor=colors.grey)))
+    if cfg["company_phone"].strip():
+        txt.append(Paragraph("Phone: " + escape(cfg["company_phone"]), P(fontSize=8.5, textColor=colors.grey)))
+    logo = _img(cfg["logo_b64"], 32 * mm, 20 * mm)
+    head = Table([[logo, txt]], colWidths=[36 * mm, 144 * mm]) if logo else Table([[txt]], colWidths=[180 * mm])
+    head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    h2 = P(fontName=FB, fontSize=11, leading=14, spaceBefore=10, spaceAfter=4)
+    story = [head, HRFlowable(width="100%", color=accent, thickness=1.2, spaceBefore=5, spaceAfter=4),
+             Paragraph("PIGMY DEPOSIT PASSBOOK", P(fontName=FB, fontSize=10, alignment=1, textColor=colors.grey)),
+             Spacer(1, 8)]
+
+    # ---- account details
+    info = [["Account No.", f"#{a.acc_id}", "Status", a.status],
+            ["Customer", Paragraph(escape(a.customer), P()), "Phone", a.phone or "-"],
+            ["Address", Paragraph(escape(addr), P()), "Agent", a.agent],
+            ["Daily deposit", rs(a.daily_amount), "Interest rate", f"{a.rate:g}% p.a."],
+            ["Start date", a.start_date.strftime("%d-%b-%Y"), "Maturity date", a.maturity_date.strftime("%d-%b-%Y")],
+            ["Tenure", f"{a.tenure_days} days", "Days paid", f"{int(a.days_paid)} / {a.tenure_days}"]]
+    t = grid(info, [28 * mm, 62 * mm, 28 * mm, 62 * mm], header=False)
+    t.setStyle(TableStyle([("FONTNAME", (0, 0), (0, -1), FB), ("FONTNAME", (2, 0), (2, -1), FB),
+                           ("BACKGROUND", (0, 0), (0, -1), zebra), ("BACKGROUND", (2, 0), (2, -1), zebra),
+                           ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+    story += [t, Paragraph("Summary", h2)]
+
+    st_ = grid([["Total deposited", "Interest accrued", "Total payable"],
+                [rs(a.principal), rs(a.interest), rs(a.payable)]], [60 * mm] * 3)
+    st_.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("FONTNAME", (0, 1), (-1, 1), FB),
+                             ("FONTSIZE", (0, 1), (-1, 1), 11)]))
+    story += [st_, Paragraph("Transactions", h2)]
+
+    # ---- transactions
+    rows = [["#", "Date", f"Deposit ({R})", f"Balance ({R})"]]
+    for i, r in enumerate(tx.itertuples(), 1):
+        rows.append([i, pd.to_datetime(r.coll_date).strftime("%d-%b-%Y"), inr(r.amount), inr(r.balance)])
+    if len(rows) == 1:
+        rows.append(["-", "No deposits yet", "-", "-"])
+    tt = grid(rows, [15 * mm, 55 * mm, 55 * mm, 55 * mm])
+    tt.setStyle(TableStyle([("ALIGN", (2, 0), (-1, -1), "RIGHT"), ("ALIGN", (0, 0), (0, -1), "CENTER")]))
+    story.append(tt)
+
+    if not po.empty:
+        p = po.iloc[0]
+        story += [Paragraph("Payout", h2),
+                  grid([["Paid on", "Type", "Principal", "Interest", "Total paid"],
+                        [p.paid_on, p.kind, rs(p.principal), rs(p.interest), rs(p.total)]],
+                       [30 * mm, 32 * mm, 40 * mm, 38 * mm, 40 * mm])]
+
+    # ---- signature & stamp block
+    d = Drawing(26 * mm, 26 * mm)
+    d.add(Circle(13 * mm, 13 * mm, 12.5 * mm, strokeColor=colors.grey, strokeWidth=0.8,
+                 strokeDashArray=[3, 2], fillColor=None))
+    d.add(String(13 * mm, 14 * mm, "STAMP", textAnchor="middle", fontName=F, fontSize=8, fillColor=colors.lightgrey))
+    d.hAlign = "CENTER"
+    sign = _img(cfg["sign_b64"], 46 * mm, 20 * mm)
+    lab = P(fontSize=8, alignment=1, textColor=colors.grey)
+    blk = Table([["", "", d, "", sign or ""],
+                 [Paragraph("Customer signature", lab), "", Paragraph("Company seal", lab), "",
+                  Paragraph(f"{escape(cfg['signatory'])}<br/>for {escape(cfg['company_name'])}", lab)]],
+                colWidths=[58 * mm, 6 * mm, 52 * mm, 6 * mm, 58 * mm], rowHeights=[28 * mm, None])
+    blk.setStyle(TableStyle([("VALIGN", (0, 0), (-1, 0), "BOTTOM"), ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                             ("LINEABOVE", (0, 1), (0, 1), 0.6, ink), ("LINEABOVE", (4, 1), (4, 1), 0.6, ink),
+                             ("TOPPADDING", (0, 1), (-1, 1), 3)]))
+    story += [KeepTogether([Spacer(1, 14), blk, Spacer(1, 8),
+                            Paragraph("Interest is simple interest on each deposit from its deposit date until "
+                                      "maturity. Figures are system generated as of the print date.",
+                                      P(fontSize=7.5, textColor=colors.grey))])]
+    return story
+
+
+def build_passbooks_pdf(acc_ids, df=None):
+    """One PDF containing a passbook for every account id (each starts on a new page)."""
+    acc_ids = [int(i) for i in acc_ids]
+    df = accounts_df() if df is None else df
+    cfg, (F, FB, R) = get_settings(), pdf_fonts()
+    S = {"font": F, "bold": FB, "rupee": R, "cfg": cfg}
+    addr = q("SELECT a.id AS acc_id, c.address FROM accounts a JOIN customers c ON c.id=a.customer_id"
+             ).set_index("acc_id")["address"]
+    col = q("SELECT account_id, coll_date, amount FROM collections ORDER BY coll_date, id")
+    pay = q("SELECT account_id, paid_on, principal, interest, total, kind FROM payouts")
+    story = []
+    for n, aid in enumerate(acc_ids):
+        a = df[df.acc_id == aid].iloc[0]
+        tx = col[col.account_id == aid].copy()
+        tx["balance"] = tx["amount"].cumsum()
+        if n:
+            story.append(PageBreak())
+        story.append(AcctMark(f"Passbook #{aid} · {a.customer}"))
+        story += passbook_story(a, addr.get(aid) or "-", tx, pay[pay.account_id == aid], S)
+    buf = BytesIO()
+    doc = PassbookDoc(buf, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm,
+                      bottomMargin=18 * mm, title="Pigmy passbook", author=cfg["company_name"])
+    doc.font = F
+    doc.build(story)
+    return buf.getvalue()
+
+
+def make_passbook(acc_id):
+    return build_passbooks_pdf([acc_id])
 
 
 # --------------------------------------------------------------------- login
@@ -252,6 +518,8 @@ def page_collect(user):
         c[3].metric("Missed days", int(r.missed_days))
         amt = st.number_input("Amount", min_value=0.0, value=float(r.daily_amount), step=float(r.daily_amount))
         cd = st.date_input("Date", date.today(), max_value=date.today(), key="single_date")
+        st.download_button("📘 Passbook (PDF)", make_passbook(r.acc_id), f"passbook_{r.acc_id}.pdf",
+                           "application/pdf", key="pb_single")
         if st.button("Collect", type="primary"):
             if amt <= 0:
                 st.error("Enter an amount.")
@@ -331,6 +599,8 @@ def page_customers(user):
     rows = {label(r): r.acc_id for r in df.itertuples()}
     if rows:
         aid = rows[st.selectbox("Account", list(rows))]
+        st.download_button("📘 Download passbook (PDF)", make_passbook(aid), f"passbook_{aid}.pdf",
+                           "application/pdf", type="primary")
         st.dataframe(q("SELECT coll_date AS date, amount FROM collections WHERE account_id=? ORDER BY coll_date DESC",
                        (int(aid),)), hide_index=True, use_container_width=True)
 
@@ -426,6 +696,88 @@ def page_reports():
         st.download_button("⬇️ Download accounts CSV", acc.to_csv(index=False), "accounts.csv")
 
 
+def page_bulk(user):
+    st.header("🖨️ Bulk passbooks")
+    is_admin = user["role"] == "admin"
+    df = accounts_df(None if is_admin else user["id"])
+    if df.empty:
+        st.info("No accounts yet.")
+        return
+    c = st.columns(3)
+    agent_id = None if is_admin else user["id"]
+    if is_admin:
+        ags = {f"{n}": i for i, n in df[["agent_id", "agent"]].drop_duplicates().itertuples(index=False)}
+        pick = c[0].selectbox("Agent", ["All agents"] + sorted(ags))
+        agent_id = None if pick == "All agents" else ags[pick]
+    status = c[1].selectbox("Accounts", ["Active", "Closed", "All"])
+    order = c[2].selectbox("Order by", ["Customer name", "Account no."])
+    if agent_id:
+        df = df[df.agent_id == agent_id]
+    if status != "All":
+        df = df[df.status == status.upper()]
+    df = df.sort_values("customer" if order == "Customer name" else "acc_id")
+    st.caption(f"{len(df)} passbook(s) · {df.agent.nunique()} agent(s)")
+    st.dataframe(df[["acc_id", "customer", "agent", "principal", "interest", "status"]],
+                 hide_index=True, use_container_width=True)
+    split = is_admin and agent_id is None and st.checkbox("One PDF per agent (download as ZIP)")
+    if st.button("Generate passbooks", type="primary", disabled=df.empty):
+        with st.spinner(f"Building {len(df)} passbook(s)…"):
+            full = accounts_df()
+            if split:
+                zbuf = BytesIO()
+                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+                    for aid_, g in df.groupby("agent_id"):
+                        nm = re.sub(r"\W+", "_", g.agent.iloc[0])
+                        z.writestr(f"passbooks_{nm}_{aid_}.pdf", build_passbooks_pdf(g.acc_id, full))
+                st.session_state.bulk = (zbuf.getvalue(), f"passbooks_by_agent_{date.today()}.zip", "application/zip")
+            else:
+                st.session_state.bulk = (build_passbooks_pdf(df.acc_id, full),
+                                         f"passbooks_{date.today()}.pdf", "application/pdf")
+    if "bulk" in st.session_state:
+        data, name, mime = st.session_state.bulk
+        st.download_button(f"⬇️ Download {name}", data, name, mime)
+
+
+def page_settings():
+    st.header("⚙️ Company settings (printed on passbooks)")
+    s = get_settings()
+    with st.form("settings"):
+        name = st.text_input("Company name", s["company_name"])
+        addr = st.text_area("Address", s["company_address"])
+        c = st.columns(2)
+        phone = c[0].text_input("Phone", s["company_phone"])
+        sig = c[1].text_input("Signatory title", s["signatory"])
+        c = st.columns(2)
+        logo = c[0].file_uploader("Logo (PNG/JPG)", type=["png", "jpg", "jpeg"])
+        sign = c[1].file_uploader("Signature image (PNG, transparent background works best)",
+                                  type=["png", "jpg", "jpeg"])
+        rm_logo, rm_sign = c[0].checkbox("Remove logo"), c[1].checkbox("Remove signature")
+        if st.form_submit_button("Save", type="primary"):
+            for k, v in {"company_name": name.strip() or COMPANY_NAME, "company_address": addr.strip(),
+                         "company_phone": phone.strip(), "signatory": sig.strip() or "Authorised Signatory"}.items():
+                set_setting(k, v)
+            try:
+                for key, up, rm in (("logo_b64", logo, rm_logo), ("sign_b64", sign, rm_sign)):
+                    if up:
+                        set_setting(key, prep_image(up))
+                    elif rm:
+                        set_setting(key, "")
+                st.success("Saved.")
+            except Exception as e:
+                st.error(f"Could not read the image: {e}")
+    s = get_settings()
+    c = st.columns(2)
+    if s["logo_b64"]:
+        c[0].image(base64.b64decode(s["logo_b64"]), caption="Current logo", width=140)
+    if s["sign_b64"]:
+        c[1].image(base64.b64decode(s["sign_b64"]), caption="Current signature", width=180)
+    st.divider()
+    accs = accounts_df()
+    if not accs.empty:
+        st.download_button("👁️ Preview sample passbook", make_passbook(accs.acc_id.iloc[0]),
+                           "passbook_preview.pdf", "application/pdf")
+
+
 # ---------------------------------------------------------------------- main
 def main():
     init_db()
@@ -433,12 +785,16 @@ def main():
         login_screen()
         return
     user = st.session_state.user
-    st.sidebar.title("💰 Pigmy")
+    cfg = get_settings()
+    if cfg["logo_b64"]:
+        st.sidebar.image(base64.b64decode(cfg["logo_b64"]), width=90)
+    st.sidebar.title(cfg["company_name"])
     st.sidebar.caption(f"{user['name']} · {user['role']}")
-    pages = {"Collect": lambda: page_collect(user), "Customers & Accounts": lambda: page_customers(user)}
+    pages = {"Collect": lambda: page_collect(user), "Customers & Accounts": lambda: page_customers(user),
+             "Bulk passbooks": lambda: page_bulk(user)}
     if user["role"] == "admin":
         pages = {"Dashboard": page_dashboard, **pages, "Payouts": lambda: page_payouts(user),
-                 "Agents": page_agents, "Reports": page_reports}
+                 "Agents": page_agents, "Reports": page_reports, "Settings": page_settings}
     choice = st.sidebar.radio("Menu", list(pages))
     if st.sidebar.button("Logout"):
         del st.session_state.user
